@@ -48,6 +48,7 @@ _Static_assert(WORK_QUEUE_MAX_N_THREADS >= HTP_MAX_NTHREADS,
 
 struct htp_handle {
     struct htp_context * ctx;
+    bool                 no_hmx; // set by hwinfo when the DSP refuses the HMX power request
 };
 
 static inline uint64_t htp_mmap(uint32_t fd, uint64_t size, uint32_t flags) {
@@ -442,6 +443,29 @@ static const struct htp_power_profile htp_power_profiles[HTP_POWER_MODE_COUNT] =
 
 #undef HTP_POWER_PROFILE_ENTRY
 
+// Vote HMX power (and the HMX clock, where the request has one) on or off for a HAP_power client
+static int htp_hmx_power(void * client, const struct htp_power_profile * pwr, bool on) {
+    HAP_power_request_t request;
+    memset(&request, 0, sizeof(HAP_power_request_t));
+#if __HVX_ARCH__ >= 75
+    request.type             = HAP_power_set_HMX_v2;
+    request.hmx_v2.set_power = TRUE;
+    request.hmx_v2.power_up  = on ? TRUE : FALSE;
+    if (on) {
+        request.hmx_v2.set_clock     = TRUE;
+        request.hmx_v2.target_corner = pwr->hmx_target_corner;
+        request.hmx_v2.min_corner    = pwr->hmx_min_corner;
+        request.hmx_v2.max_corner    = pwr->hmx_max_corner;
+        request.hmx_v2.perf_mode     = pwr->hmx_perf_mode;
+    }
+#else
+    (void) pwr;
+    request.type         = HAP_power_set_HMX;
+    request.hmx.power_up = on ? TRUE : FALSE;
+#endif
+    return HAP_power_set(client, &request);
+}
+
 AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp_queue_id, uint32_t n_hvx, uint32_t n_hmx, uint64_t vtcm_size, uint64_t max_vmem, uint32_t power_mode) {
     struct htp_handle * h = (struct htp_handle *) handle;
     if (!h) {
@@ -463,6 +487,10 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
     if (h->ctx) {
         FARF(ERROR, "Queue already open");
         return AEE_EITEMBUSY;
+    }
+
+    if (h->no_hmx) {
+        n_hmx = 0;
     }
 
     // Cache the original FastRPC thread priority, then calculate compute priority
@@ -619,43 +647,16 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
         }
     }
 
-#if __HVX_ARCH__ >= 75
-    {
-        // Power on HMX and set HMX clock
-        HAP_power_request_t request;
-        memset(&request, 0, sizeof(HAP_power_request_t));
-        request.type = HAP_power_set_HMX_v2;
-        request.hmx_v2.set_power     = TRUE;
-        request.hmx_v2.power_up      = TRUE;
-        request.hmx_v2.set_clock     = TRUE;
-        request.hmx_v2.target_corner = pwr->hmx_target_corner;
-        request.hmx_v2.min_corner    = pwr->hmx_min_corner;
-        request.hmx_v2.max_corner    = pwr->hmx_max_corner;
-        request.hmx_v2.perf_mode     = pwr->hmx_perf_mode;
-        FARF(ALWAYS, "Setting HMX clock\n");
-        err = HAP_power_set((void *) ctx, &request);
-        if (err != AEE_SUCCESS) {
-            FARF(ERROR, "ggml-hex: error setting HMX clock.");
-            htp_iface_stop(handle);
-            return err;
-        }
-    }
-#else
-    {
-        // Power on HMX
-        HAP_power_request_t request;
-        memset(&request, 0, sizeof(HAP_power_request_t));
-        request.type         = HAP_power_set_HMX;
-        request.hmx.power_up = TRUE;
+    if (n_hmx) {
+        // Power on HMX and set the HMX clock
         FARF(ALWAYS, "Powering HMX on\n");
-        err = HAP_power_set((void *) ctx, &request);
+        err = htp_hmx_power((void *) ctx, pwr, true);
         if (err != AEE_SUCCESS) {
-            FARF(ERROR, "ggml-hex: error powering on HMX.");
+            FARF(ERROR, "ggml-hex: error powering on HMX: 0x%08x", (unsigned) err);
             htp_iface_stop(handle);
             return err;
         }
     }
-#endif
 
     ctx->hmx_enabled = n_hmx;
     ctx->hmx_queue   = NULL;
@@ -760,8 +761,8 @@ AEEResult htp_iface_stop(remote_handle64 handle) {
 }
 
 AEEResult htp_iface_hwinfo(remote_handle64 handle, uint32_t * n_threads, uint32_t * n_hvx, uint32_t * n_hmx, uint64_t * vtcm_size) {
-    (void)handle;
-    if (!n_threads || !n_hvx || !n_hmx || !vtcm_size) {
+    struct htp_handle * h = (struct htp_handle *) handle;
+    if (!h || !n_threads || !n_hvx || !n_hmx || !vtcm_size) {
         return AEE_EBADPARM;
     }
 
@@ -781,6 +782,24 @@ AEEResult htp_iface_hwinfo(remote_handle64 handle, uint32_t * n_threads, uint32_
     *n_threads = n_hvx_val;
     *n_hvx     = n_hvx_val;
     *n_hmx     = 1;
+
+    // Some DSP images refuse the HMX power request. Report no HMX there, so the host
+    // keeps every op on HVX and start does not fail on the same request.
+    if (!h->ctx) {
+        const struct htp_power_profile * pwr = &htp_power_profiles[HTP_POWER_MODE_BURST];
+        int err = htp_hmx_power((void *) h, pwr, true);
+        if (err == AEE_SUCCESS) {
+            // start votes again for its own client, so a stale probe vote only costs power
+            int err_off = htp_hmx_power((void *) h, pwr, false);
+            if (err_off != AEE_SUCCESS) {
+                FARF(ERROR, "ggml-hex: HMX power release after the probe failed with 0x%08x", (unsigned) err_off);
+            }
+        } else {
+            FARF(ERROR, "ggml-hex: HMX power request failed with 0x%08x, HMX is off", (unsigned) err);
+            *n_hmx = 0;
+        }
+        h->no_hmx = (err != AEE_SUCCESS);
+    }
 
     *vtcm_size = vtcm_query_size();
 
